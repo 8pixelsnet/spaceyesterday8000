@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Space Yesterday 8000</title>
 <style>
   html, body {
@@ -21,11 +22,32 @@
     image-rendering: -moz-crisp-edges;
     background: #0a0420;
     display: block;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
+  #fsbtn {
+    position: fixed;
+    top: 8px;
+    right: 8px;
+    z-index: 10;
+    background: rgba(0, 240, 255, 0.15);
+    color: #00f0ff;
+    border: 1.5px solid #00f0ff;
+    font: bold 14px monospace;
+    padding: 6px 10px;
+    cursor: pointer;
+    border-radius: 4px;
+    letter-spacing: 1px;
+    display: none;
+  }
+  #fsbtn:active { background: rgba(0, 240, 255, 0.35); }
 </style>
 </head>
 <body>
 <canvas id="game" width="480" height="270"></canvas>
+<button id="fsbtn">FULLSCREEN</button>
 <script>
 'use strict';
 (() => {
@@ -38,13 +60,37 @@ const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 ctx.imageSmoothingEnabled = false;
 
+// Mobile detection (used early by resize for landscape rotation, and later by input/UI)
+const IS_MOBILE = (() => {
+  const hasTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  return hasTouch && (coarse || window.innerWidth < 900);
+})();
+
+function shouldRotateForLandscape() {
+  return !!(IS_MOBILE && document.fullscreenElement && window.innerWidth < window.innerHeight);
+}
 function resize() {
-  const sw = window.innerWidth, sh = window.innerHeight;
+  const rot = shouldRotateForLandscape();
+  const sw = rot ? window.innerHeight : window.innerWidth;
+  const sh = rot ? window.innerWidth  : window.innerHeight;
   const scale = Math.max(1, Math.min(Math.floor(sw / W), Math.floor(sh / H)));
   canvas.style.width = (W * scale) + 'px';
   canvas.style.height = (H * scale) + 'px';
+  if (rot) {
+    canvas.style.position = 'fixed';
+    canvas.style.left = '50%';
+    canvas.style.top = '50%';
+    canvas.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+  } else {
+    canvas.style.position = '';
+    canvas.style.left = '';
+    canvas.style.top = '';
+    canvas.style.transform = '';
+  }
 }
 window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
 resize();
 
 const PAL = {
@@ -75,12 +121,95 @@ window.addEventListener('keydown', (e) => {
   audio.ensure();
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
-window.addEventListener('mousedown', () => audio.ensure());
-window.addEventListener('touchstart', () => audio.ensure());
 
 function consumePressed(code) {
   if (pressed[code]) { pressed[code] = false; return true; }
   return false;
+}
+
+// --- Virtual pad (active when pointer is held in bottom half of canvas)
+const pad = {
+  active: false, pointerId: null,
+  ox: 0, oy: 0, cx: 0, cy: 0,
+  radius: 28, deadzone: 3,
+};
+
+// --- Multi-pointer tracking (used for mobile auto-pause)
+const activePointers = new Set();
+
+function clientToCanvas(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  if (canvas.style.transform.indexOf('rotate(90deg)') !== -1) {
+    // Canvas is CSS-rotated 90° CW (landscape forced on portrait device).
+    // Inverse-map screen coords back through the rotation.
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+    const scale = rect.height / W; // CSS px per game px (height of AABB == W * scale)
+    return { x: W / 2 + dy / scale, y: H / 2 - dx / scale };
+  }
+  return {
+    x: (clientX - rect.left) / rect.width * W,
+    y: (clientY - rect.top) / rect.height * H,
+  };
+}
+
+function endPointer(e) {
+  if (pad.active && e.pointerId === pad.pointerId) {
+    pad.active = false;
+    pad.pointerId = null;
+  }
+  activePointers.delete(e.pointerId);
+  // Mobile auto-pause: when no fingers are touching during play
+  if (IS_MOBILE && activePointers.size === 0 &&
+      (game.state === 'PLAYING' || game.state === 'BOSS')) {
+    game.prevState = game.state;
+    game.state = 'PAUSED';
+    audio.pause();
+  }
+}
+
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+canvas.addEventListener('pointerdown', (e) => {
+  audio.ensure();
+  activePointers.add(e.pointerId);
+  // MENU / GAMEOVER taps act as Space
+  if (game.state === 'MENU' || game.state === 'GAMEOVER') {
+    pressed['Space'] = true;
+    return;
+  }
+  // PAUSED: resume immediately (mobile holds-to-play; desktop click also works)
+  if (game.state === 'PAUSED') {
+    game.state = game.prevState;
+    audio.resume();
+    // fall through so the same touch can immediately start the pad
+  }
+  // In play: bottom-half tap starts the virtual pad at the touch origin
+  const c = clientToCanvas(e.clientX, e.clientY);
+  if ((game.state === 'PLAYING' || game.state === 'BOSS') && c.y >= H / 2 && !pad.active) {
+    pad.active = true;
+    pad.pointerId = e.pointerId;
+    pad.ox = c.x; pad.oy = c.y;
+    pad.cx = c.x; pad.cy = c.y;
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  }
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!pad.active || e.pointerId !== pad.pointerId) return;
+  const c = clientToCanvas(e.clientX, e.clientY);
+  pad.cx = c.x; pad.cy = c.y;
+});
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+
+function getPadAxis() {
+  if (!pad.active) return { x: 0, y: 0 };
+  const dx = pad.cx - pad.ox, dy = pad.cy - pad.oy;
+  const m = Math.hypot(dx, dy);
+  if (m < pad.deadzone) return { x: 0, y: 0 };
+  const r = Math.min(m, pad.radius) / pad.radius;
+  return { x: (dx / m) * r, y: (dy / m) * r };
 }
 
 // ============================================================
@@ -90,89 +219,240 @@ const NOTE = (m) => 440 * Math.pow(2, (m - 69) / 12);
 const N = {
   G2:43, A2:45, Bb2:46, C3:48, D3:50, Eb3:51, F3:53, Fs3:54, G3:55, A3:57, Bb3:58,
   C4:60, D4:62, Eb4:63, F4:65, Fs4:66, G4:67, A4:69, Bb4:70, C5:72, D5:74, Eb5:75,
-  F5:77, G5:79, A5:81, Bb5:82, C6:84,
+  F5:77, Fs5:78, G5:79, A5:81, Bb5:82, C6:84,
 };
 
 // Durations are in eighth notes. Tempo = 200 BPM (Molto Allegro).
-// Original 16-bar form in G minor (harmonic):
-//   A  (1-4):  theme in Gm, half-cadence then perfect cadence to G
-//   B  (5-8):  contrast in Bb major (relative), high register, cadence to Bb
-//   A' (9-12): theme returns in Gm with iv–V tension
-//   C  (13-16): unison scale ascent to G5, peak at Bb5, descent and final cadence
-const MELODY = [
-  // --- A: Gm theme ---
-  // Bar 1 (i): ascending Gm arpeggio with Eb appoggiatura
-  [N.G4,1],[N.Bb4,1],[N.D5,1],[N.Eb5,1],[N.D5,2],[N.Bb4,2],
-  // Bar 2 (i): descending answer to G
-  [N.C5,1],[N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,2],[N.G4,2],
-  // Bar 3 (i): theme restate
-  [N.G4,1],[N.Bb4,1],[N.D5,1],[N.Eb5,1],[N.D5,2],[N.Bb4,2],
-  // Bar 4 (V → i): leading-tone cadence, held G half-note
-  [N.C5,1],[N.Bb4,1],[N.A4,1],[N.Fs4,1],[N.G4,4],
-  // --- B: contrast in Bb major ---
-  // Bar 5 (Bb): brighter theme up to Bb5
-  [N.Bb4,1],[N.D5,1],[N.F5,1],[N.Bb5,1],[N.A5,2],[N.G5,2],
-  // Bar 6 (Bb): descent
-  [N.F5,1],[N.G5,1],[N.F5,1],[N.Eb5,1],[N.D5,2],[N.C5,2],
-  // Bar 7 (V/Bb = F7): preparation
-  [N.Bb4,1],[N.C5,1],[N.D5,1],[N.Eb5,1],[N.F5,2],[N.D5,2],
-  // Bar 8 (V7 → I of Bb): cadence to Bb
+// Long-form chiptune in G minor — ~2.5 minute loop, built from three 16-bar
+// sections arranged A → B → C → A → B → C → A → B (128 bars total).
+//   Section A: main motif in Gm — half-step trill Bb-A landing on G, with
+//              internal Bb-major contrast and a climactic scale ascent.
+//   Section B: arpeggio + appoggiatura theme in Bb major (relative major) —
+//              brighter, leaping melodic shape that contrasts with A's trill.
+//   Section C: developmental — motif transposed and fragmented, multiple
+//              variants of the trill gesture, ends on a held V chord that
+//              resolves into the next A section.
+
+const SECTION_A_MELODY = [
+  // Bar 1 (i): trill Bb-A landing on G (the iconic Mozart-shaped gesture)
+  [N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.G4,2],
+  // Bar 2 (i): motif repeat (classical-style restatement)
+  [N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.G4,2],
+  // Bar 3 (V): sequenced trill A-G landing on F# (the leading tone)
+  [N.A4,1],[N.G4,1],[N.A4,1],[N.G4,1],[N.A4,1],[N.G4,1],[N.Fs4,2],
+  // Bar 4 (V→i): descending scale + leading-tone cadence to G
+  [N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,1],[N.Fs4,2],[N.G4,2],
+  // Bar 5 (Bb): broken-chord launch up to Bb5
+  [N.Bb4,1],[N.D5,1],[N.F5,1],[N.Bb5,1],[N.A5,1],[N.Bb5,1],[N.F5,1],[N.D5,1],
+  // Bar 6 (Bb): descending scale answer
+  [N.G5,1],[N.F5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,1],[N.Bb4,1],
+  // Bar 7 (V/Bb = F7): F-major arpeggio preparation
+  [N.C5,1],[N.D5,1],[N.F5,1],[N.D5,1],[N.C5,1],[N.A4,1],[N.F4,1],[N.A4,1],
+  // Bar 8 (V→I of Bb): leading-tone cadence to Bb
   [N.Eb5,1],[N.D5,1],[N.C5,1],[N.A4,1],[N.Bb4,4],
-  // --- A': Gm theme returns ---
-  // Bar 9 (i): theme returns
-  [N.G4,1],[N.Bb4,1],[N.D5,1],[N.Eb5,1],[N.D5,2],[N.Bb4,2],
-  // Bar 10 (i): descending answer
-  [N.C5,1],[N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,2],[N.G4,2],
-  // Bar 11 (iv = Cm): tension, Cm arpeggio up to G5
-  [N.C5,1],[N.Eb5,1],[N.G5,1],[N.Eb5,1],[N.C5,2],[N.G4,2],
-  // Bar 12 (V = D7): dominant prep, D7 chord tones
-  [N.A4,1],[N.Fs4,1],[N.A4,1],[N.D5,1],[N.C5,2],[N.A4,2],
-  // --- C: climax ---
-  // Bar 13: full G-minor scale ascent (parallel with bass walk)
+  // Bar 9 (i): motif returns
+  [N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.G4,2],
+  // Bar 10 (i): motif repeat
+  [N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.G4,2],
+  // Bar 11 (iv = Cm): Cm arpeggio climbs to Bb5
+  [N.C5,1],[N.Eb5,1],[N.G5,1],[N.Bb5,1],[N.G5,1],[N.Eb5,1],[N.C5,2],
+  // Bar 12 (V = D7): D7 outline in high register, tension before climax
+  [N.D5,1],[N.Fs5,1],[N.A5,1],[N.Fs5,1],[N.D5,1],[N.Fs5,1],[N.A4,2],
+  // Bar 13: G-minor scale ascent (unison with bass walk for impact)
   [N.G4,1],[N.A4,1],[N.Bb4,1],[N.C5,1],[N.D5,1],[N.Eb5,1],[N.F5,1],[N.G5,1],
-  // Bar 14: peak then descent through Eb chord
-  [N.G5,2],[N.F5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,1],
-  // Bar 15: continue descent with leading tone
-  [N.C5,1],[N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.G4,2],[N.Fs4,2],
-  // Bar 16 (V → i): final perfect cadence
+  // Bar 14 (peak): trill at the top (G-F#), descent through Eb chord
+  [N.G5,1],[N.Fs5,1],[N.G5,1],[N.Fs5,1],[N.F5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],
+  // Bar 15 (i): main motif returns one last time, with closing tail
+  [N.Bb4,1],[N.A4,1],[N.Bb4,1],[N.A4,1],[N.G4,1],[N.A4,1],[N.Bb4,1],[N.G4,1],
+  // Bar 16 (V→i): final perfect cadence with F# leading tone
   [N.A4,1],[N.C5,1],[N.Bb4,1],[N.Fs4,1],[N.G4,4],
 ];
 
-// Bass: driving eighth-note pulse on the bar's chord root, with
-// cadential shifts and a unison scale walk in bar 13.
-const BASS = [
-  // Bar 1 (i): G pulse
-  [N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
-  // Bar 2 (i): G pulse
-  [N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
-  // Bar 3 (i): G pulse
-  [N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
-  // Bar 4 (V → i): D then G
-  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
-  // Bar 5 (I of Bb): Bb pulse
-  [N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],
-  // Bar 6 (I of Bb): Bb pulse
-  [N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],
-  // Bar 7 (V/Bb = F7): F pulse
+const SECTION_B_MELODY = [
+  // Bar 1 (I=Bb): arpeggio motif with Eb appoggiatura
+  [N.F4,1],[N.Bb4,1],[N.D5,1],[N.F5,1],[N.Eb5,2],[N.D5,2],
+  // Bar 2 (I): motif repeat
+  [N.F4,1],[N.Bb4,1],[N.D5,1],[N.F5,1],[N.Eb5,2],[N.D5,2],
+  // Bar 3 (V=F7): F-major arpeggio variation
+  [N.F4,1],[N.A4,1],[N.C5,1],[N.F5,1],[N.Eb5,2],[N.C5,2],
+  // Bar 4 (V→I): descending cadence to Bb
+  [N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,1],[N.Bb4,4],
+  // Bar 5 (I): descending scale with closing rise
+  [N.F5,1],[N.G5,1],[N.F5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],[N.Bb4,1],[N.D5,1],
+  // Bar 6 (I): ascending push up to Bb5
+  [N.F5,1],[N.G5,1],[N.F5,1],[N.Eb5,1],[N.D5,1],[N.Eb5,1],[N.F5,1],[N.Bb5,1],
+  // Bar 7 (V=F7): descending arpeggio
+  [N.A5,1],[N.G5,1],[N.F5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],[N.A4,1],[N.C5,1],
+  // Bar 8 (V→I): cadence to Bb
+  [N.F5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],[N.Bb4,4],
+  // Bar 9 (I): motif returns
+  [N.F4,1],[N.Bb4,1],[N.D5,1],[N.F5,1],[N.Eb5,2],[N.D5,2],
+  // Bar 10 (I): repeat
+  [N.F4,1],[N.Bb4,1],[N.D5,1],[N.F5,1],[N.Eb5,2],[N.D5,2],
+  // Bar 11 (vi=Gm): modal mixture — Gm arpeggio
+  [N.G4,1],[N.Bb4,1],[N.D5,1],[N.G5,1],[N.F5,2],[N.D5,2],
+  // Bar 12 (V): C5-D5 setup back to V
+  [N.C5,1],[N.A4,1],[N.C5,1],[N.D5,1],[N.F5,2],[N.C5,2],
+  // Bar 13 (I): broken-chord sweep up + descent from Bb5
+  [N.Bb4,1],[N.D5,1],[N.F5,1],[N.Bb5,1],[N.A5,1],[N.G5,1],[N.F5,1],[N.D5,1],
+  // Bar 14 (IV=Eb): Eb chord with alternating G5
+  [N.Eb5,1],[N.G5,1],[N.Eb5,1],[N.G5,1],[N.D5,1],[N.F5,1],[N.C5,1],[N.F5,1],
+  // Bar 15 (V=F7): F7 arpeggio sweep
+  [N.F5,1],[N.D5,1],[N.C5,1],[N.A4,1],[N.F4,1],[N.A4,1],[N.C5,1],[N.F5,1],
+  // Bar 16 (V→I): final cadence to Bb
+  [N.Eb5,1],[N.D5,1],[N.C5,1],[N.A4,1],[N.Bb4,4],
+];
+
+const SECTION_C_MELODY = [
+  // Bar 1 (i=Gm): new motif — trill D-Eb landing on G (different from A)
+  [N.D5,1],[N.Eb5,1],[N.D5,1],[N.Eb5,1],[N.D5,1],[N.Eb5,1],[N.G4,2],
+  // Bar 2 (i): repeat
+  [N.D5,1],[N.Eb5,1],[N.D5,1],[N.Eb5,1],[N.D5,1],[N.Eb5,1],[N.G4,2],
+  // Bar 3 (Cm-tinted): transposed motif up — trill G-F lands on Eb
+  [N.G5,1],[N.F5,1],[N.G5,1],[N.F5,1],[N.G5,1],[N.F5,1],[N.Eb5,2],
+  // Bar 4 (V→i): descending scale answer
+  [N.F5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,1],[N.G4,2],
+  // Bar 5 (V): F#-G trill landing on D
+  [N.Fs5,1],[N.G5,1],[N.Fs5,1],[N.G5,1],[N.Fs5,1],[N.G5,1],[N.D5,2],
+  // Bar 6 (V): D major arpeggio sweep
+  [N.A5,1],[N.Fs5,1],[N.D5,1],[N.A4,1],[N.D5,1],[N.Fs5,1],[N.A5,1],[N.D5,1],
+  // Bar 7 (i): Gm arpeggio cascade down
+  [N.G5,1],[N.Bb5,1],[N.D5,1],[N.G5,1],[N.D5,1],[N.Bb4,1],[N.G4,1],[N.D4,1],
+  // Bar 8 (V→i): short cadence to G
+  [N.Bb4,1],[N.A4,1],[N.G4,1],[N.Fs4,1],[N.G4,4],
+  // Bar 9 (i): high-register motif — trill G-F# lands on D
+  [N.G5,1],[N.Fs5,1],[N.G5,1],[N.Fs5,1],[N.G5,1],[N.Fs5,1],[N.D5,2],
+  // Bar 10 (i): repeat
+  [N.G5,1],[N.Fs5,1],[N.G5,1],[N.Fs5,1],[N.G5,1],[N.Fs5,1],[N.D5,2],
+  // Bar 11 (iv-tinted): another variant — Eb-D trill lands on G
+  [N.Eb5,1],[N.D5,1],[N.Eb5,1],[N.D5,1],[N.Eb5,1],[N.D5,1],[N.G4,2],
+  // Bar 12 (V): mixed motif + descent into A4
+  [N.D5,1],[N.Eb5,1],[N.D5,1],[N.C5,1],[N.D5,1],[N.Eb5,1],[N.D5,1],[N.A4,1],
+  // Bar 13: crescendo gesture climbing to Bb5
+  [N.Fs5,1],[N.G5,1],[N.A5,1],[N.Bb5,1],[N.A5,1],[N.G5,1],[N.Fs5,1],[N.D5,1],
+  // Bar 14: D7 arpeggio cascade down
+  [N.A5,1],[N.Fs5,1],[N.D5,1],[N.A4,1],[N.Fs4,1],[N.D4,1],[N.Fs4,1],[N.A4,1],
+  // Bar 15: descent then climb to set up the V hold
+  [N.D5,1],[N.C5,1],[N.Bb4,1],[N.A4,1],[N.G4,1],[N.Fs4,1],[N.A4,1],[N.C5,1],
+  // Bar 16 (V hold): D7 outline + held D5 — strong V→i setup into next A
+  [N.D5,1],[N.Fs4,1],[N.A4,1],[N.C5,1],[N.D5,4],
+];
+
+const SECTION_A_BASS = [
+  // Bar 1 (i): G-D root-fifth bounce
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 2 (i): same
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 3 (V): D pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+  // Bar 4 (V→i): D then G-D bounce
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 5 (I of Bb): Bb-F bounce
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 6 (I of Bb): same
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 7 (V/Bb=F7): F pulse
   [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],
-  // Bar 8 (V → I of Bb): F then Bb
-  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],
-  // Bar 9 (i return): G pulse
-  [N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
-  // Bar 10 (i): G pulse
-  [N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
-  // Bar 11 (iv = Cm): C pulse
-  [N.C3,1],[N.C3,1],[N.C3,1],[N.C3,1],[N.C3,1],[N.C3,1],[N.C3,1],[N.C3,1],
-  // Bar 12 (V = D7): D pulse
+  // Bar 8 (V→I of Bb): F then Bb-F bounce
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 9 (i return): G-D bounce
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 10 (i): same
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 11 (iv=Cm): C-Eb pulse
+  [N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],
+  // Bar 12 (V=D7): D pulse
   [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
   // Bar 13: G-minor scale walk in unison with melody
   [N.G2,1],[N.A2,1],[N.Bb2,1],[N.C3,1],[N.D3,1],[N.Eb3,1],[N.F3,1],[N.G3,1],
-  // Bar 14 (peak Eb → V): Eb then D
+  // Bar 14 (peak): Eb pulse then D pulse
   [N.Eb3,1],[N.Eb3,1],[N.Eb3,1],[N.Eb3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
-  // Bar 15 (i): G pulse
-  [N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
-  // Bar 16 (V → i): D then G — final perfect cadence
+  // Bar 15 (i): G-D bounce
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 16 (V→i): D then G — final perfect cadence
   [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
+];
+
+const SECTION_B_BASS = [
+  // Bar 1 (I=Bb): Bb-F bounce
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 2 (I): same
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 3 (V=F7): F pulse
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],
+  // Bar 4 (V→I): F then Bb-F bounce
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 5 (I): Bb-F bounce
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 6 (I): same
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 7 (V): F pulse
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],
+  // Bar 8 (V→I): F then Bb pulse
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],
+  // Bar 9 (I): Bb-F bounce
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 10 (I): same
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 11 (vi=Gm): G-D bounce — modal mixture
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 12 (V): F pulse
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],
+  // Bar 13 (I): Bb-F bounce
+  [N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],[N.Bb2,1],[N.F3,1],
+  // Bar 14 (IV=Eb): Eb pulse
+  [N.Eb3,1],[N.Eb3,1],[N.Eb3,1],[N.Eb3,1],[N.Eb3,1],[N.Eb3,1],[N.Eb3,1],[N.Eb3,1],
+  // Bar 15 (V=F7): F pulse
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],
+  // Bar 16 (V→I): F then Bb pulse
+  [N.F3,1],[N.F3,1],[N.F3,1],[N.F3,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],[N.Bb2,1],
+];
+
+const SECTION_C_BASS = [
+  // Bar 1 (i=Gm): G-D bounce
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 2 (i): same
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 3 (Cm-tinted): C-Eb pulse
+  [N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],
+  // Bar 4 (back to i): G-D bounce
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 5 (V): D pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+  // Bar 6 (V): D pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+  // Bar 7 (i): G-D bounce
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 8 (V→i): D then G pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.G2,1],[N.G2,1],[N.G2,1],[N.G2,1],
+  // Bar 9 (i): G-D bounce
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 10 (i): same
+  [N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],[N.G2,1],[N.D3,1],
+  // Bar 11 (iv-tinted): C-Eb pulse
+  [N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],[N.C3,1],[N.Eb3,1],
+  // Bar 12 (V): D pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+  // Bar 13 (V buildup): D pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+  // Bar 14 (V): D pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+  // Bar 15 (V): D pulse
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+  // Bar 16 (V hold): D pulse for full bar — strong V→i setup into next A
+  [N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],[N.D3,1],
+];
+
+// Arrangement: A → B → C → A → B → C → A → B (8 sections × 16 bars = 128 bars)
+const MELODY = [
+  ...SECTION_A_MELODY, ...SECTION_B_MELODY, ...SECTION_C_MELODY,
+  ...SECTION_A_MELODY, ...SECTION_B_MELODY, ...SECTION_C_MELODY,
+  ...SECTION_A_MELODY, ...SECTION_B_MELODY,
+];
+const BASS = [
+  ...SECTION_A_BASS, ...SECTION_B_BASS, ...SECTION_C_BASS,
+  ...SECTION_A_BASS, ...SECTION_B_BASS, ...SECTION_C_BASS,
+  ...SECTION_A_BASS, ...SECTION_B_BASS,
 ];
 
 function expandSeq(seq) {
@@ -184,7 +464,7 @@ function expandSeq(seq) {
 }
 const MELODY_SLOTS = expandSeq(MELODY);
 const BASS_SLOTS   = expandSeq(BASS);
-const LOOP_EIGHTHS = MELODY_SLOTS.length; // 16 bars × 8 eighths = 128
+const LOOP_EIGHTHS = MELODY_SLOTS.length; // 128 bars × 8 eighths = 1024 (~2.5 min loop)
 
 const audio = {
   ctx: null, master: null, melodyGain: null, bassGain: null, drumGain: null,
@@ -836,7 +1116,11 @@ function updatePlayer(dt) {
   if (keys['KeyD'] || keys['ArrowRight']) dx += 1;
   if (keys['KeyW'] || keys['ArrowUp'])    dy -= 1;
   if (keys['KeyS'] || keys['ArrowDown'])  dy += 1;
-  if (dx !== 0 && dy !== 0) { dx *= 0.7071; dy *= 0.7071; }
+  const pa = getPadAxis();
+  dx += pa.x; dy += pa.y;
+  // Clamp magnitude to 1 (handles diagonals + pad + keyboard combined)
+  const mag = Math.hypot(dx, dy);
+  if (mag > 1) { dx /= mag; dy /= mag; }
   const speedMult = game.active.speed > 0 ? 1.5 : 1.0;
   p.x += dx * p.speed * speedMult * dt;
   p.y += dy * p.speed * speedMult * dt;
@@ -851,9 +1135,9 @@ function updatePlayer(dt) {
     spawnParticle(tx, ty, (Math.random()*40 - 20), 60 + Math.random()*40, 0.3, c, 1, 0);
   }
 
-  // Shooting
+  // Shooting — auto-fire (player only steers)
   p.fireTimer -= dt;
-  if (keys['Space'] && p.fireTimer <= 0) {
+  if (p.fireTimer <= 0) {
     const rate = game.active.rapid > 0 ? 0.10 : 0.18;
     p.fireTimer = rate;
     if (game.active.triple > 0) {
@@ -1251,6 +1535,7 @@ function drawPowerups() {
 function spawnBoss() {
   game.boss = {
     x: W/2, y: -80,
+    startY: -80,
     targetY: 90,
     w: 120, h: 120,
     hp: 60, maxHp: 60,
@@ -1262,6 +1547,7 @@ function spawnBoss() {
     fireTimer: 1.6,
     radialTimer: 2.4,
     intro: 2.5,
+    introDur: 2.5,
     flashT: 0,
     dead: false,
     deathT: 0,
@@ -1280,14 +1566,17 @@ function updateBoss(dt) {
   if (b.flashT > 0) b.flashT -= dt;
   if (b.dead) {
     b.deathT += dt;
+    const DEATH_DUR = 2.0;
+    // Constant strong quake throughout the entire dying animation
+    if (game.shake < 0.55) game.shake = 0.55;
     if (Math.random() < 0.4) {
       const ang = Math.random()*Math.PI*2;
       const r = Math.random()*45;
       spawnExplosion(b.x + Math.cos(ang)*r, b.y + Math.sin(ang)*r, 8,
         [PAL.magenta, PAL.cyan, PAL.white, PAL.yellow]);
     }
-    if (b.deathT > 2.5) {
-      game.shake = 1.5;
+    if (b.deathT > DEATH_DUR) {
+      game.shake = 0;       // credits begin steady
       game.flash = 0.5;
       game.boss = null;
       game.state = 'CREDITS';
@@ -1296,15 +1585,14 @@ function updateBoss(dt) {
     return;
   }
 
-  // Intro descent — ease to targetY, then snap and freeze
+  // Intro descent — smoothstep from startY to targetY over introDur so we
+  // arrive exactly at targetY (no residual snap when the shield drops).
   if (b.intro > 0) {
-    b.intro -= dt;
-    if (b.intro <= 0) {
-      b.intro = 0;
-      b.y = b.targetY;
-    } else {
-      b.y = lerp(b.y, b.targetY, dt * 1.5);
-    }
+    b.intro = Math.max(0, b.intro - dt);
+    const progress = 1 - b.intro / b.introDur;
+    const s = progress * progress * (3 - 2 * progress);
+    b.y = b.startY + (b.targetY - b.startY) * s;
+    if (b.intro === 0) b.y = b.targetY;
     return;
   }
   // Shield is down — boss holds position (no hover bob)
@@ -1528,7 +1816,8 @@ function checkCollisions() {
           if (B.hp <= 0) {
             B.dead = true;
             B.deathT = 0;
-            game.shake = 0.8;
+            game.shake = 1.0;
+            game.flash = 0.4;
           }
         }
       }
@@ -1701,13 +1990,20 @@ function drawMenu(dt) {
   drawVoxelTitle(ctx, text, ((W - titleW) / 2) | 0, titleY | 0, pixSize, 1, -2, -2);
 
   const blink = Math.floor(tt * 2) % 2 === 0;
-  if (blink) drawTextCentered(ctx, 'PRESS SPACE TO PLAY', 130, PAL.cyan, 2);
+  if (blink) drawTextCentered(ctx, IS_MOBILE ? 'TAP TO PLAY' : 'PRESS SPACE TO PLAY', 130, PAL.cyan, 2);
 
   // Controls block
+  const ctlColor = mixHex(PAL.cyan, PAL.white, 0.4);
   drawText(ctx, 'CONTROLS:', 20, 175, PAL.yellow, 1);
-  drawText(ctx, 'WASD/ARROWS - MOVE',  20, 188, mixHex(PAL.cyan, PAL.white, 0.4), 1);
-  drawText(ctx, 'SPACE       - FIRE',  20, 198, mixHex(PAL.cyan, PAL.white, 0.4), 1);
-  drawText(ctx, 'ESC         - PAUSE', 20, 208, mixHex(PAL.cyan, PAL.white, 0.4), 1);
+  if (IS_MOBILE) {
+    drawText(ctx, 'DRAG BOTTOM HALF - MOVE', 20, 188, ctlColor, 1);
+    drawText(ctx, 'AUTO FIRE',               20, 198, ctlColor, 1);
+  } else {
+    drawText(ctx, 'WASD/ARROWS - MOVE',  20, 188, ctlColor, 1);
+    drawText(ctx, 'DRAG MOUSE  - MOVE',  20, 198, ctlColor, 1);
+    drawText(ctx, 'AUTO FIRE',           20, 208, ctlColor, 1);
+    drawText(ctx, 'ESC - PAUSE',         20, 218, ctlColor, 1);
+  }
 
   // Credits block
   const cx0 = W - 30 - textWidth('AUGUSTOCORRE', 1);
@@ -1749,7 +2045,7 @@ function updatePlaying(dt) {
       game.spawnTimer = interval * (0.7 + Math.random() * 0.6);
       spawnEnemy();
     }
-    if (game.score >= 1000) {
+    if (game.score >= 100) {
       spawnBoss();
       game.state = 'BOSS';
     }
@@ -1825,7 +2121,7 @@ function drawGameOver(dt) {
   drawTextCentered(ctx, 'GAME OVER', H/2 - 18, PAL.red, 3);
   drawTextCentered(ctx, 'SCORE  ' + String(game.score).padStart(5, '0'), H/2 + 8, PAL.white, 1);
   if (Math.floor(game.elapsedT * 2) % 2 === 0) {
-    drawTextCentered(ctx, 'PRESS SPACE', H/2 + 28, PAL.cyan, 1);
+    drawTextCentered(ctx, IS_MOBILE ? 'TAP TO RESTART' : 'PRESS SPACE', H/2 + 28, PAL.cyan, 1);
   }
   game.elapsedT += dt;
   if (consumePressed('Space')) {
@@ -1846,7 +2142,7 @@ function updateCredits(dt) {
   if (game.shake > 0) game.shake -= dt;
   if (game.flash > 0) game.flash -= dt;
   // Auto-return to menu when scroll completes
-  if (game.creditsT > 18) {
+  if (game.creditsT > 20) {
     game.state = 'MENU';
     game.menuT = 0;
     game.shake = 0;
@@ -1885,8 +2181,8 @@ function drawCredits() {
   drawTextCentered(ctx, 'LOADING...', baseY + 100, PAL.cyan, 2);
   ctx.globalAlpha = 1;
 
-  drawTextCentered(ctx, '- THE COSMIC CLOCK FALLS -', baseY + 130, mixHex(PAL.cyan, PAL.white, 0.4), 1);
-  drawTextCentered(ctx, 'THANKS FOR PLAYING', baseY + 145, PAL.yellow, 1);
+  drawTextCentered(ctx, '- THE COSMIC CLOCK FALLS -', baseY + 170, mixHex(PAL.cyan, PAL.white, 0.4), 1);
+  drawTextCentered(ctx, 'THANKS FOR PLAYING', baseY + 185, PAL.yellow, 1);
 }
 
 // ============================================================
@@ -1904,7 +2200,38 @@ function drawPaused() {
   ctx.fillStyle = 'rgba(10, 4, 32, 0.65)';
   ctx.fillRect(0, 0, W, H);
   drawTextCentered(ctx, 'PAUSED', H/2 - 6, PAL.white, 3);
-  drawTextCentered(ctx, 'PRESS ESC TO RESUME', H/2 + 14, PAL.cyan, 1);
+  drawTextCentered(ctx, IS_MOBILE ? 'KEEP TOUCHING TO RESUME' : 'PRESS ESC TO RESUME', H/2 + 14, PAL.cyan, 1);
+}
+
+// ============================================================
+// ===== VIRTUAL PAD ==========================================
+// ============================================================
+function drawPad() {
+  if (!pad.active) return;
+  if (game.state !== 'PLAYING' && game.state !== 'BOSS') return;
+  const dx = pad.cx - pad.ox, dy = pad.cy - pad.oy;
+  const m = Math.hypot(dx, dy);
+  const ang = Math.atan2(dy, dx);
+  const r = Math.min(m, pad.radius);
+  const sx = pad.ox + Math.cos(ang) * r;
+  const sy = pad.oy + Math.sin(ang) * r;
+
+  ctx.save();
+  // Outer disc (translucent fill + cyan ring)
+  ctx.globalAlpha = 0.55;
+  ctx.fillStyle = 'rgba(0, 240, 255, 0.10)';
+  ctx.beginPath(); ctx.arc(pad.ox, pad.oy, pad.radius, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = PAL.cyan;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(pad.ox, pad.oy, pad.radius, 0, Math.PI*2); ctx.stroke();
+  // Inner stick
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = PAL.cyan;
+  ctx.beginPath(); ctx.arc(sx, sy, 9, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = PAL.white;
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(sx, sy, 9, 0, Math.PI*2); ctx.stroke();
+  ctx.restore();
 }
 
 // ============================================================
@@ -1939,6 +2266,7 @@ function frame(now) {
     acc -= FIXED_DT;
   }
   render();
+  updateFsBtn();
   // Clear edge-trigger keys that weren't consumed (single-frame events)
   for (const k in pressed) pressed[k] = false;
   requestAnimationFrame(frame);
@@ -1992,8 +2320,34 @@ function render() {
   }
 
   drawScanlines();
+  drawPad();
   ctx.restore();
 }
+
+// ============================================================
+// ===== FULLSCREEN (mobile) ==================================
+// ============================================================
+const fsBtn = document.getElementById('fsbtn');
+async function toggleFullscreen() {
+  try {
+    if (!document.fullscreenElement) {
+      await document.documentElement.requestFullscreen();
+      try { await screen.orientation.lock('landscape'); } catch (_) {}
+    } else {
+      await document.exitFullscreen();
+    }
+  } catch (_) {}
+  resize();
+}
+if (IS_MOBILE) {
+  fsBtn.addEventListener('click', toggleFullscreen);
+}
+function updateFsBtn() {
+  if (!IS_MOBILE) { fsBtn.style.display = 'none'; return; }
+  const s = game.state;
+  fsBtn.style.display = (s === 'MENU' || s === 'GAMEOVER' || s === 'PAUSED') ? 'block' : 'none';
+}
+document.addEventListener('fullscreenchange', resize);
 
 // ============================================================
 // ===== INIT =================================================
