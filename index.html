@@ -74,7 +74,12 @@ function resize() {
   const rot = shouldRotateForLandscape();
   const sw = rot ? window.innerHeight : window.innerWidth;
   const sh = rot ? window.innerWidth  : window.innerHeight;
-  const scale = Math.max(1, Math.min(Math.floor(sw / W), Math.floor(sh / H)));
+  // Mobile: fractional scaling so we fill as much of the screen as possible
+  // (image-rendering: pixelated still nearest-neighbours the pixels cleanly).
+  // Desktop: integer scaling for true pixel-perfect rendering.
+  const scale = IS_MOBILE
+    ? Math.min(sw / W, sh / H)
+    : Math.max(1, Math.min(Math.floor(sw / W), Math.floor(sh / H)));
   canvas.style.width = (W * scale) + 'px';
   canvas.style.height = (H * scale) + 'px';
   if (rot) {
@@ -131,7 +136,7 @@ function consumePressed(code) {
 const pad = {
   active: false, pointerId: null,
   ox: 0, oy: 0, cx: 0, cy: 0,
-  radius: 28, deadzone: 3,
+  radius: 18, deadzone: 3,
 };
 
 // --- Multi-pointer tracking (used for mobile auto-pause)
@@ -2045,7 +2050,7 @@ function updatePlaying(dt) {
       game.spawnTimer = interval * (0.7 + Math.random() * 0.6);
       spawnEnemy();
     }
-    if (game.score >= 100) {
+    if (game.score >= 1000) {
       spawnBoss();
       game.state = 'BOSS';
     }
